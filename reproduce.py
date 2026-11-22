@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import bisect
 import csv
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 import json
 import math
 from pathlib import Path
@@ -15,8 +15,14 @@ import numpy as np
 
 ROOT = Path(__file__).resolve().parent
 RAW = ROOT / "raw"
+BACKTEST = ROOT / "backtest"
 
 DAY_MS = 86_400_000
+HOUR_MS = 3_600_000
+WEEK_MS = 7 * DAY_MS
+SHIFT_16Z_MS = 8 * HOUR_MS
+MONDAY_16Z_EPOCH_MS = 4 * DAY_MS + 16 * HOUR_MS  # 1970-01-05T16:00:00Z (Monday)
+
 HLP_VAULT_ADDR = "0xecb63caa47c7c4e77f60f1ce858cf28dc2b82b00"
 MIN_CAPITAL_USD = 3_000_000.0
 MIN_HISTORY_DAYS = 30.0
@@ -26,6 +32,9 @@ MIN_CHURN_EVAL_DAYS = 20
 MAX_DAILY_CHURN = 1.0
 MAX_DAILY_FLIP_RATE = 0.20
 HEDGE_MIN_OFFSET_RATIO = 0.70
+COMPLETE_LIFE_POS_TOLERANCE = 1e-2
+MIN_SIGNAL_WARMUP_DATE = "2025-07-30"
+MIN_QUORUM_WHALES = 15
 
 ENTRY_TILT = 0.15
 EXIT_TILT = 0.05
@@ -51,8 +60,8 @@ DECAY_CUT_SIZE_MULT = 0.50
 
 
 def bar_date_for_16z_open_ms(open_ts_ms: int) -> str:
-    close_dt = datetime.fromtimestamp((open_ts_ms + DAY_MS) / 1000.0, tz=UTC)
-    return close_dt.strftime("%Y-%m-%d")
+    shifted_sec = (int(open_ts_ms) + SHIFT_16Z_MS) / 1000.0
+    return datetime.fromtimestamp(shifted_sec, tz=UTC).strftime("%Y-%m-%d")
 
 
 def close_ts_ms_for_16z_bar(bar_date: str) -> int:
@@ -61,24 +70,46 @@ def close_ts_ms_for_16z_bar(bar_date: str) -> int:
 
 
 def build_causal_nav_features(
-    raw_av_by_addr: dict[str, list[tuple[int, float, float]]]
+    raw_av_by_addr: dict[str, list[tuple[int, float, float]]],
+    *,
+    now_ms: int | None = None,
 ) -> dict[str, tuple[list[int], list[float], list[float], list[int]]]:
-    min_week_ms = int(6.5 * DAY_MS)
     nav_feat: dict[str, tuple[list[int], list[float], list[float], list[int]]] = {}
     for addr, pts in raw_av_by_addr.items():
         if not pts:
             continue
-        ts_list, peak_list, pf_list, weeks_list = [], [], [], []
+        pts_ts = [int(p[0]) for p in pts]
+        first_ts = pts_ts[0]
+        last_ts = pts_ts[-1]
+        horizon_ts = max(last_ts, int(now_ms)) if (now_ms is not None and int(now_ms) > last_ts) else last_ts
+        k_start = ((first_ts - MONDAY_16Z_EPOCH_MS) // WEEK_MS) + 1
+        k_end = (horizon_ts - MONDAY_16Z_EPOCH_MS) // WEEK_MS
+
+        events: list[tuple[int, int, float, float]] = [
+            (int(p[0]), 0, float(p[1]), float(p[2])) for p in pts
+        ]
+        for k in range(k_start, k_end + 1):
+            w_ms = MONDAY_16Z_EPOCH_MS + k * WEEK_MS
+            idx = bisect.bisect_right(pts_ts, w_ms) - 1
+            if idx >= 0:
+                events.append((w_ms, 1, float(pts[idx][1]), float(pts[idx][2])))
+        events.sort(key=lambda item: (item[0], item[1]))
+
+        av_timestamps: list[int] = []
+        peak_list: list[float] = []
+        pf_list: list[float] = []
+        weeks_list: list[int] = []
         peak_av = 0.0
         gross_profit = 0.0
         gross_loss = 0.0
         active_weeks = 0
-        base_ts, base_av, base_cp = pts[0]
+        base_av, base_cp = float(pts[0][1]), float(pts[0][2])
         prev_peak = max(base_av, 0.0)
-        for ts_ms, av_val, cum_pnl in pts:
+
+        for ts_ms, is_monday_close, av_val, cum_pnl in events:
             if av_val > peak_av:
                 peak_av = av_val
-            if (ts_ms - base_ts) >= min_week_ms:
+            if is_monday_close == 1:
                 dp = cum_pnl - base_cp
                 net_cash_flow = (av_val - base_av) - dp
                 denom = max(base_av + 0.5 * max(net_cash_flow, 0.0), prev_peak * 0.15, 100_000.0)
@@ -89,14 +120,19 @@ def build_causal_nav_features(
                         gross_profit += week_ret
                     else:
                         gross_loss += -week_ret
-                base_ts, base_av, base_cp = ts_ms, av_val, cum_pnl
+                base_av, base_cp = av_val, cum_pnl
                 prev_peak = peak_av
             pf = (gross_profit / gross_loss) if gross_loss > 1e-9 else (99.0 if gross_profit > 0.0 else 0.0)
-            ts_list.append(ts_ms)
-            peak_list.append(peak_av)
-            pf_list.append(pf)
-            weeks_list.append(active_weeks)
-        nav_feat[addr] = (ts_list, peak_list, pf_list, weeks_list)
+            if av_timestamps and av_timestamps[-1] == ts_ms:
+                peak_list[-1] = peak_av
+                pf_list[-1] = pf
+                weeks_list[-1] = active_weeks
+            else:
+                av_timestamps.append(ts_ms)
+                peak_list.append(peak_av)
+                pf_list.append(pf)
+                weeks_list.append(active_weeks)
+        nav_feat[addr] = (av_timestamps, peak_list, pf_list, weeks_list)
     return nav_feat
 
 
@@ -117,7 +153,7 @@ def load_raw_inputs() -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[
             }
             for r in csv.DictReader(f)
         ]
-    oi_map = {}
+    oi_map: dict[str, float] = {}
     with (RAW / "btc_exchange_oi_daily.csv").open(encoding="utf-8") as f:
         for r in csv.DictReader(f):
             oi_map[r["bar_date"]] = float(r["hl_btc_oi"])
@@ -131,21 +167,28 @@ def reconstruct_signals(candles: list[dict[str, Any]], wallets: list[dict[str, A
     with (RAW / "wallet_av_history.csv").open(encoding="utf-8") as f:
         for r in csv.DictReader(f):
             raw_av.setdefault(r["address"], []).append((int(r["ts_ms"]), float(r["acct_val"]), float(r["cum_pnl"])))
-    nav_feat = build_causal_nav_features(raw_av)
+    nav_feat = build_causal_nav_features(raw_av, now_ms=now_ms)
 
     fills_by_w: dict[str, tuple[list[int], list[float]]] = {}
-    cur_a, ts_b, ep_b = None, [], []
+    broken_chain_addrs: set[str] = set()
+    prev_ep_by_w: dict[str, float] = {}
     with (RAW / "wallet_btc_fills.csv").open(encoding="utf-8") as f:
         for r in csv.DictReader(f):
             a = r["address"]
-            if a != cur_a:
-                if cur_a is not None:
-                    fills_by_w[cur_a] = (ts_b, ep_b)
-                cur_a, ts_b, ep_b = a, [], []
-            ts_b.append(int(r["ts_ms"]))
-            ep_b.append(float(r["end_pos"]))
-    if cur_a is not None:
-        fills_by_w[cur_a] = (ts_b, ep_b)
+            sp = float(r["start_pos"])
+            ep = float(r["end_pos"])
+            if a not in prev_ep_by_w:
+                if abs(sp) >= COMPLETE_LIFE_POS_TOLERANCE:
+                    broken_chain_addrs.add(a)
+            elif abs(sp - prev_ep_by_w[a]) >= COMPLETE_LIFE_POS_TOLERANCE:
+                broken_chain_addrs.add(a)
+            prev_ep_by_w[a] = ep
+            pair = fills_by_w.get(a)
+            if pair is None:
+                pair = ([], [])
+                fills_by_w[a] = pair
+            pair[0].append(int(r["ts_ms"]))
+            pair[1].append(ep)
 
     f_exact: dict[str, dict[str, float]] = {}
     f_comp: dict[str, dict[str, float]] = {}
@@ -155,18 +198,15 @@ def reconstruct_signals(candles: list[dict[str, Any]], wallets: list[dict[str, A
             target.setdefault(r["address"], {})[r["bar_date"]] = float(r["szi"])
 
     spot_by_w: dict[str, tuple[list[int], list[float]]] = {}
-    cur_a, sts_b, ssp_b = None, [], []
     with (RAW / "wallet_spot_ubtc_daily.csv").open(encoding="utf-8") as f:
         for r in csv.DictReader(f):
             a = r["address"]
-            if a != cur_a:
-                if cur_a is not None:
-                    spot_by_w[cur_a] = (sts_b, ssp_b)
-                cur_a, sts_b, ssp_b = a, [], []
-            sts_b.append(int(r["obs_ts_ms"]))
-            ssp_b.append(float(r["spot_ubtc"]))
-    if cur_a is not None:
-        spot_by_w[cur_a] = (sts_b, ssp_b)
+            pair = spot_by_w.get(a)
+            if pair is None:
+                pair = ([], [])
+                spot_by_w[a] = pair
+            pair[0].append(int(r["obs_ts_ms"]))
+            pair[1].append(float(r["spot_ubtc"]))
 
     lb_addrs = {r["address"].lower() for r in wallets if int(r["on_leaderboard"]) == 1}
     models = []
@@ -181,10 +221,20 @@ def reconstruct_signals(candles: list[dict[str, Any]], wallets: list[dict[str, A
         exact_since = w.get("exact_16z_since_bar") or ""
         if max_comp_bar and exact_since and exact_since <= max_comp_bar:
             exact_since = bar_date_for_16z_open_ms(close_ts_ms_for_16z_bar(max_comp_bar) + DAY_MS)
+        cur_szi = float(w["cur_btc_szi"] or 0.0)
+        raw_comp_life = bool(int(w["is_complete_lifetime"])) and (addr not in broken_chain_addrs)
+        if raw_comp_life:
+            fp = fills_by_w.get(addr)
+            if fp is not None and fp[1]:
+                is_comp_life = abs(float(fp[1][-1]) - cur_szi) < COMPLETE_LIFE_POS_TOLERANCE
+            else:
+                is_comp_life = abs(cur_szi) < COMPLETE_LIFE_POS_TOLERANCE
+        else:
+            is_comp_life = False
         models.append({
             "addr": addr,
-            "cur_szi": float(w["cur_btc_szi"] or 0.0),
-            "is_complete_life": bool(int(w["is_complete_lifetime"])),
+            "cur_szi": cur_szi,
+            "is_complete_life": is_comp_life,
             "fills_synced_to_ms": int(w["fills_synced_to_ms"] or 0),
             "funding_backfilled": bool(int(w["funding_backfilled"])),
             "funding_synced_to_ms": int(w["funding_synced_to_ms"] or 0),
@@ -206,6 +256,9 @@ def reconstruct_signals(candles: list[dict[str, Any]], wallets: list[dict[str, A
         prev_bdate = candles[bi - 1]["bar_date"] if bi > 0 else bdate
         bar_closed = bool(c["is_complete"])
         t_ms = min(int(c["close_ts_ms"]), now_ms)
+        bdate_close_ms = close_ts_ms_for_16z_bar(bdate)
+        before_warmup = bdate < MIN_SIGNAL_WARMUP_DATE
+
         long_btc = short_btc = 0.0
         long_w = short_w = admitted = 0
         for wm in models:
@@ -216,17 +269,21 @@ def reconstruct_signals(candles: list[dict[str, Any]], wallets: list[dict[str, A
             fc = f_comp.get(addr, {})
             if not bar_closed:
                 szi_t = wm["cur_szi"]
-            elif bdate in fe:
+            elif t_ms >= bdate_close_ms and bdate in fe:
                 szi_t = fe[bdate]
+            elif (
+                t_ms >= bdate_close_ms
+                and bdate_close_ms <= wm["funding_synced_to_ms"]
+                and (
+                    (wm["exact_16z_since_bar"] and bdate >= wm["exact_16z_since_bar"])
+                    or (wm["settled_16z_bar"] and bdate == wm["settled_16z_bar"])
+                )
+            ):
+                szi_t = fe.get(bdate, 0.0)
             elif wm["is_complete_life"] and addr in fills_by_w and t_ms <= wm["fills_synced_to_ms"]:
                 ts_f, ep_f = fills_by_w[addr]
                 idx_f = bisect.bisect_right(ts_f, t_ms) - 1
                 szi_t = ep_f[idx_f] if idx_f >= 0 else fc.get(prev_bdate, 0.0)
-            elif t_ms <= wm["funding_synced_to_ms"] and (
-                (wm["exact_16z_since_bar"] and bdate >= wm["exact_16z_since_bar"])
-                or (wm["settled_16z_bar"] and bdate == wm["settled_16z_bar"])
-            ):
-                szi_t = fe.get(bdate, 0.0)
             elif 0 < wm["position_synced_at_ms"] <= t_ms and wm["position_synced_at_ms"] > (t_ms - DAY_MS):
                 szi_t = wm["cur_szi"]
             elif prev_bdate in fe:
@@ -246,6 +303,8 @@ def reconstruct_signals(candles: list[dict[str, Any]], wallets: list[dict[str, A
                 wm["active_days"] += 1
             wm["prev_szi"] = szi_t
 
+            if before_warmup:
+                continue
             if (t_ms - wm["first_av_ms"]) / float(DAY_MS) < MIN_HISTORY_DAYS:
                 continue
             ts_a, pk_a, pf_a, ns_a = nav_feat[addr]
@@ -255,13 +314,15 @@ def reconstruct_signals(candles: list[dict[str, Any]], wallets: list[dict[str, A
             if wm["active_days"] >= MIN_CHURN_EVAL_DAYS:
                 if (wm["cum_diff_szi"] / max(wm["cum_abs_szi"], 1e-6)) > MAX_DAILY_CHURN or (wm["flip_days"] / wm["active_days"]) > MAX_DAILY_FLIP_RATE:
                     continue
-            admitted += 1
+            if wm["cum_abs_szi"] > 1e-4:
+                admitted += 1
             if abs(szi_t) < 1e-4:
                 continue
             sp = spot_by_w.get(addr)
-            if szi_t < -0.5 and sp is not None:
+            if szi_t < -0.5 and sp is not None and sp[0] and sp[1]:
                 idx_sp = bisect.bisect_right(sp[0], t_ms) - 1
-                if idx_sp >= 0 and sp[1][idx_sp] >= HEDGE_MIN_OFFSET_RATIO * abs(szi_t):
+                sp_ubtc = sp[1][idx_sp] if idx_sp >= 0 else sp[1][0]
+                if sp_ubtc >= HEDGE_MIN_OFFSET_RATIO * abs(szi_t):
                     continue
             if szi_t > 0:
                 long_btc += szi_t
@@ -270,6 +331,8 @@ def reconstruct_signals(candles: list[dict[str, Any]], wallets: list[dict[str, A
                 short_btc += abs(szi_t)
                 short_w += 1
 
+        if before_warmup:
+            continue
         active_w = long_w + short_w
         gross = long_btc + short_btc
         if gross > 1e-6 and active_w >= 5:
@@ -287,23 +350,301 @@ def reconstruct_signals(candles: list[dict[str, Any]], wallets: list[dict[str, A
     return out
 
 
+def average_ranks(arr: np.ndarray) -> np.ndarray:
+    n = len(arr)
+    order = np.argsort(arr, kind="mergesort")
+    ranks = np.empty(n, dtype=np.float64)
+    sv = arr[order]
+    i = 0
+    while i < n:
+        j = i + 1
+        while j < n and sv[j] == sv[i]:
+            j += 1
+        ranks[order[i:j]] = 0.5 * (i + j - 1) + 1.0
+        i = j
+    return ranks
+
+
+def spearman_corr(x: np.ndarray, y: np.ndarray) -> float | None:
+    if len(x) < 3 or len(x) != len(y):
+        return None
+    rx, ry = average_ranks(x), average_ranks(y)
+    if float(np.std(rx)) <= 1e-12 or float(np.std(ry)) <= 1e-12:
+        return 0.0
+    c = float(np.corrcoef(rx, ry)[0, 1])
+    return c if math.isfinite(c) else None
+
+
+def compute_rv20(closes: list[float]) -> list[float | None]:
+    n = len(closes)
+    rets = [(closes[i] / closes[i - 1] - 1.0) if (i > 0 and closes[i - 1] > 0.0) else 0.0 for i in range(n)]
+    out: list[float | None] = [None] * n
+    for i in range(20, n):
+        seg = np.array(rets[i - 19 : i + 1], dtype=np.float64)
+        v = float(np.std(seg, ddof=1)) * math.sqrt(365.0)
+        out[i] = v if math.isfinite(v) else None
+    return out
+
+
+def simulate_series(
+    comp_bars: list[dict[str, Any]],
+    start_date: str,
+    *,
+    fixed_lev: float | None = None,
+    size_mult_by_date: dict[str, float] | None = None,
+) -> dict[str, Any]:
+    closes = [float(b["btc_close"]) for b in comp_bars]
+    rv20 = compute_rv20(closes)
+    s_idx = next(i for i, b in enumerate(comp_bars) if b["bar_date"] >= start_date)
+    eq = INITIAL_CAPITAL_USD
+    peak_eq = eq
+    cur_dir = 0
+    cur_lev = 0.0
+    cur_units = 0.0
+    entry_px = stop_px = 0.0
+    entry_date = ""
+    held_days = 0
+    lockout = 0
+    dates, dd_pcts, rets = [], [], []
+    closed_trades = 0
+    won_trades = 0
+    trade_eq_start = eq
+
+    for i in range(s_idx, len(comp_bars)):
+        b = comp_bars[i]
+        bd = b["bar_date"]
+        px_o, px_h, px_l, px_c = b["btc_open"], b["btc_high"], b["btc_low"], b["btc_close"]
+        prev_c = closes[i - 1] if (i > s_idx and i > 0) else px_c
+        tilt = b.get("l1_tilt")
+        vol_i = rv20[i]
+        eq_prev = eq
+        stopped = False
+
+        if cur_dir != 0 and prev_c > 0 and abs(cur_units) > 0:
+            held_days += 1
+            if cur_dir == 1 and stop_px > 0 and px_l <= stop_px:
+                fill_px = min(px_o, stop_px) if px_o < stop_px else stop_px
+                eq = max(1.0, eq + cur_units * (fill_px - prev_c) - abs(cur_units) * prev_c * (LONG_FUNDING_BPS_DAY * 1e-4) - abs(cur_units) * fill_px * (FEE_BPS * 1e-4))
+                closed_trades += 1
+                if eq / trade_eq_start - 1.0 > 0:
+                    won_trades += 1
+                lockout = 1
+                cur_dir, cur_lev, cur_units, entry_px, stop_px, held_days = 0, 0.0, 0.0, 0.0, 0.0, 0
+                stopped = True
+            elif cur_dir == -1 and stop_px > 0 and px_h >= stop_px:
+                fill_px = max(px_o, stop_px) if px_o > stop_px else stop_px
+                eq = max(1.0, eq + cur_units * (fill_px - prev_c) - abs(cur_units) * fill_px * (FEE_BPS * 1e-4))
+                closed_trades += 1
+                if eq / trade_eq_start - 1.0 > 0:
+                    won_trades += 1
+                lockout = -1
+                cur_dir, cur_lev, cur_units, entry_px, stop_px, held_days = 0, 0.0, 0.0, 0.0, 0.0, 0
+                stopped = True
+            else:
+                fund = abs(cur_units) * prev_c * (LONG_FUNDING_BPS_DAY * 1e-4) if cur_dir == 1 else 0.0
+                eq = max(1.0, eq + cur_units * (px_c - prev_c) - fund)
+
+        if not stopped:
+            day_mult = float(size_mult_by_date.get(bd, 1.0)) if size_mult_by_date else 1.0
+            if tilt is not None:
+                if lockout == 1 and tilt <= EXIT_TILT:
+                    lockout = 0
+                elif lockout == -1 and tilt >= -EXIT_TILT:
+                    lockout = 0
+                next_dir = cur_dir
+                if day_mult <= 0.0:
+                    next_dir = 0
+                elif cur_dir == 0:
+                    if tilt >= ENTRY_TILT and lockout != 1:
+                        next_dir = 1
+                    elif tilt <= -ENTRY_TILT and lockout != -1:
+                        next_dir = -1
+                elif cur_dir == 1:
+                    if tilt <= -ENTRY_TILT:
+                        next_dir = -1
+                    elif tilt <= EXIT_TILT:
+                        next_dir = 0
+                elif cur_dir == -1:
+                    if tilt >= ENTRY_TILT:
+                        next_dir = 1
+                    elif tilt >= -EXIT_TILT:
+                        next_dir = 0
+            else:
+                next_dir = 0 if day_mult <= 0.0 else cur_dir
+
+            if next_dir != cur_dir:
+                if fixed_lev is not None and next_dir != 0:
+                    new_lev = round(float(fixed_lev) * day_mult, 4)
+                elif next_dir != 0 and day_mult > 0.0:
+                    eff_vol = vol_i if (vol_i is not None and math.isfinite(vol_i) and vol_i > 0.0) else 0.40
+                    base_lev = min(MAX_LEV, max(MIN_LEV, VOL_TARGET_NUM / max(eff_vol, 0.20)))
+                    new_lev = round(base_lev * day_mult, 4)
+                else:
+                    new_lev = 0.0
+                if cur_dir != 0:
+                    eq = max(1.0, eq - abs(cur_units) * px_c * (FEE_BPS * 1e-4))
+                    closed_trades += 1
+                    if eq / trade_eq_start - 1.0 > 0:
+                        won_trades += 1
+                cur_dir, cur_lev = next_dir, new_lev
+                if cur_dir != 0 and px_c > 0 and new_lev > 0:
+                    trade_eq_start = eq
+                    open_notional = eq * new_lev
+                    eq = max(1.0, eq - open_notional * (FEE_BPS * 1e-4))
+                    cur_units = cur_dir * (open_notional / px_c)
+                    entry_px = px_c
+                    stop_px = px_c * (1.0 - DISASTER_STOP_PCT) if cur_dir == 1 else px_c * (1.0 + DISASTER_STOP_PCT)
+                    entry_date = bd
+                    held_days = 0
+                else:
+                    cur_dir, cur_lev, cur_units, entry_px, stop_px, held_days = 0, 0.0, 0.0, 0.0, 0.0, 0
+
+        peak_eq = max(peak_eq, eq)
+        dates.append(bd)
+        dd_pcts.append(round((eq / peak_eq - 1.0) * 100.0, 2))
+        rets.append(eq / eq_prev - 1.0)
+
+    r_arr = np.array(rets, dtype=np.float64)
+    sd = float(np.std(r_arr, ddof=1)) if len(r_arr) > 2 else 0.0
+    yrs = max(len(dates) / 365.0, 1.0 / 365.0)
+    mult = eq / INITIAL_CAPITAL_USD
+    cagr_pct = round((math.exp(min(50.0, math.log(mult) / yrs)) - 1.0) * 100.0, 2)
+    sharpe = round((float(np.mean(r_arr)) / sd * math.sqrt(365.0)) if sd > 1e-12 else 0.0, 2)
+    return {
+        "dates": dates,
+        "drawdown_pct": dd_pcts,
+        "cagr_pct": cagr_pct,
+        "max_dd_pct": min(dd_pcts) if dd_pcts else 0.0,
+        "sharpe": sharpe,
+        "equity_multiple": round(mult, 3),
+        "closed_trades": closed_trades,
+        "won_trades": won_trades,
+        "current_position": {
+            "side": "LONG" if cur_dir == 1 else ("SHORT" if cur_dir == -1 else "FLAT"),
+            "entry_date": entry_date or None,
+            "entry_px": round(entry_px, 2) if entry_px > 0 else None,
+            "leverage": round(cur_lev, 4),
+            "btc_units": round(cur_units, 5),
+        },
+    }
+
+
+def simulate_guarded_backtest(
+    candles: list[dict[str, Any]],
+    signals: dict[str, dict[str, Any]],
+    oi_map: dict[str, float],
+    settled_through: str,
+) -> dict[str, Any]:
+    comp_bars = []
+    for c in candles:
+        bd = c["bar_date"]
+        if c["is_complete"] == 1 and (not settled_through or bd <= settled_through):
+            sig = signals.get(bd, {})
+            comp_bars.append({
+                **c,
+                "l1_tilt": sig.get("l1_tilt"),
+                "l1_wallets": sig.get("l1_wallets"),
+                "l1_gross_btc": sig.get("l1_gross_btc"),
+                "hl_btc_oi": oi_map.get(bd),
+            })
+    quorum_date = next(
+        b["bar_date"]
+        for b in comp_bars
+        if b["bar_date"] >= MIN_SIGNAL_WARMUP_DATE and b.get("l1_tilt") is not None and int(b.get("l1_wallets") or 0) >= MIN_QUORUM_WHALES
+    )
+    sim_1x = simulate_series(comp_bars, quorum_date, fixed_lev=1.0)
+    dd_1x_map = dict(zip(sim_1x["dates"], sim_1x["drawdown_pct"], strict=False))
+
+    q_bars = [b for b in comp_bars if b["bar_date"] >= quorum_date]
+    closes = [b["btc_close"] for b in q_bars]
+    tilts = [b.get("l1_tilt") for b in q_bars]
+    fp_streak = 0
+    size_mult_by_date: dict[str, float] = {}
+    for t, b in enumerate(q_bars):
+        bd = b["bar_date"]
+        has_tilt = tilts[t] is not None
+        gross_btc = float(b.get("l1_gross_btc") or 0.0) if has_tilt else 0.0
+        active_w = int(b.get("l1_wallets") or 0) if has_tilt else 0
+        hl_oi = b.get("hl_btc_oi")
+        oi_share = (gross_btc / hl_oi) if (hl_oi is not None and hl_oi > 0) else None
+        fp_breach = not (
+            gross_btc >= FOOTPRINT_MIN_GROSS_BTC
+            and (True if oi_share is None else oi_share >= FOOTPRINT_MIN_HL_OI_SHARE)
+            and active_w >= FOOTPRINT_MIN_ACTIVE_WHALES
+        )
+        fp_streak = (fp_streak + 1) if fp_breach else 0
+
+        end_k = t - DECAY_IC_FORWARD_DAYS
+        ic5_val = None
+        if end_k >= DECAY_IC_WINDOW_DAYS - 1:
+            start_k = end_k - (DECAY_IC_WINDOW_DAYS - 1)
+            pairs = [
+                (tilts[k], closes[k + DECAY_IC_FORWARD_DAYS] / closes[k] - 1.0)
+                for k in range(start_k, end_k + 1)
+                if tilts[k] is not None and closes[k] > 0 and closes[k + DECAY_IC_FORWARD_DAYS] > 0
+            ]
+            if len(pairs) >= max(3, DECAY_IC_WINDOW_DAYS // 2):
+                ic5_val = spearman_corr(
+                    np.array([float(p[0]) for p in pairs], dtype=np.float64),
+                    np.array([float(p[1]) for p in pairs], dtype=np.float64),
+                )
+        dd_1x_pct = float(dd_1x_map.get(bd, 0.0))
+        ic_breach = ic5_val is not None and ic5_val < DECAY_MIN_ROLL120_IC
+        dd_breach = dd_1x_pct < DECAY_MAX_1X_DD_PCT
+        if fp_streak >= FOOTPRINT_STREAK_WARN_DAYS:
+            mult = 0.0
+        elif (ic_breach and dd_breach) or (ic5_val is not None and ic5_val < DECAY_PAUSE_IC) or (dd_1x_pct < DECAY_PAUSE_1X_DD_PCT):
+            mult = 0.0
+        elif ic_breach or dd_breach:
+            mult = DECAY_CUT_SIZE_MULT
+        else:
+            mult = 1.0
+        size_mult_by_date[bd] = mult
+
+    return simulate_series(comp_bars, quorum_date, size_mult_by_date=size_mult_by_date)
+
+
 def main() -> None:
     candles, wallets, extra = load_raw_inputs()
-    as_of = extra["meta"].get("as_of", "2026-11-22T08:00:00+00:00")
-    now_ms = int(datetime.fromisoformat(as_of).timestamp() * 1000)
+    meta = extra["meta"]
+    rebuilt_at = meta.get("signals_rebuilt_at") or meta.get("as_of") or "2026-11-22T12:59:23+00:00"
+    now_ms = int(round(datetime.fromisoformat(rebuilt_at).timestamp() * 1000))
     reconstructed = reconstruct_signals(candles, wallets, now_ms)
 
     with (RAW / "l1_daily_signals.csv").open(encoding="utf-8") as f:
-        stored = {r["bar_date"]: float(r["ls_tilt"]) for r in csv.DictReader(f)}
+        stored_rows = {r["bar_date"]: r for r in csv.DictReader(f)}
 
-    settled_dates = [c["bar_date"] for c in candles if c["is_complete"] == 1 and c["bar_date"] in stored]
-    max_diff = max(abs(reconstructed[d]["l1_tilt"] - stored[d]) for d in settled_dates if d in reconstructed)
+    settled_through = meta.get("last_settled_16z_bar") or ""
+    settled_dates = [
+        c["bar_date"]
+        for c in candles
+        if c["is_complete"] == 1 and (not settled_through or c["bar_date"] <= settled_through) and c["bar_date"] in stored_rows
+    ]
+    max_tilt_diff = max(abs(reconstructed[d]["l1_tilt"] - float(stored_rows[d]["ls_tilt"])) for d in settled_dates)
+    max_gross_diff = max(abs(reconstructed[d]["l1_gross_btc"] - float(stored_rows[d]["gross_btc"])) for d in settled_dates)
+    max_pool_diff = max(abs(reconstructed[d]["l1_admitted_pool"] - int(stored_rows[d]["admitted_pool_size"])) for d in settled_dates)
+
+    bt = simulate_guarded_backtest(candles, reconstructed, extra["oi_map"], settled_through)
+    stored_summary = json.loads((BACKTEST / "summary_metrics.json").read_text(encoding="utf-8"))
+    stored_metrics = stored_summary["sim_default_from_earliest_quorum"]["metrics"]
+
     last_settled = settled_dates[-1]
     print(json.dumps({
         "settled_signal_bars": len(settled_dates),
-        "max_tilt_diff_vs_stored": round(max_diff, 8),
+        "max_tilt_diff_vs_stored": round(max_tilt_diff, 8),
+        "max_gross_btc_diff_vs_stored": round(max_gross_diff, 8),
+        "max_admitted_pool_diff_vs_stored": max_pool_diff,
         "latest_settled_bar": last_settled,
         "latest_settled_signal": reconstructed[last_settled],
+        "reproduced_backtest": {
+            "cagr_pct": bt["cagr_pct"],
+            "stored_cagr_pct": stored_metrics["cagr_pct"],
+            "max_dd_pct": bt["max_dd_pct"],
+            "sharpe": bt["sharpe"],
+            "equity_multiple": bt["equity_multiple"],
+            "closed_trades": bt["closed_trades"],
+            "current_position": bt["current_position"],
+        },
     }, indent=2))
 
 
