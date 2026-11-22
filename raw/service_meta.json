@@ -1,0 +1,17 @@
+{
+  "as_of": "2026-11-22T08:25:38.031450+00:00",
+  "bootstrap_complete": "true",
+  "daily_1604_swept_bar": "2026-11-21",
+  "degraded": "false",
+  "degraded_reason": "",
+  "full_8h_backfill_done": "true",
+  "last_incremental_sync_at": "2026-11-22T05:52:52.358510+00:00",
+  "last_mark_poll_at": "2026-11-22T08:25:38.031450+00:00",
+  "last_settled_16z_bar": "2026-11-21",
+  "live_btc_mark": "59669.0000",
+  "live_btc_mid": "59679.5000",
+  "live_hl_btc_oi": "36663.18300",
+  "live_hl_btc_oi_usd": "2187655466.43",
+  "signals_rebuilt_at": "2026-11-22T05:52:52.358000+00:00",
+  "snapshot_revision": "491"
+}
