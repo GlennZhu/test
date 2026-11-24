@@ -35,6 +35,7 @@ MAX_DAILY_CHURN = 1.0
 MAX_DAILY_FLIP_RATE = 0.20
 HEDGE_MIN_OFFSET_RATIO = 0.70
 COMPLETE_LIFE_POS_TOLERANCE = 1e-2
+CHURN_WARMUP_START_DATE = "2025-07-01"
 MIN_SIGNAL_WARMUP_DATE = "2025-07-30"
 MIN_QUORUM_WHALES = 15
 
@@ -74,6 +75,17 @@ def close_ts_ms_for_16z_bar(bar_date: str) -> int:
 def next_bar_date(bar_date: str) -> str:
     dt = datetime.strptime(bar_date, "%Y-%m-%d").replace(tzinfo=UTC) + timedelta(days=1)
     return dt.strftime("%Y-%m-%d")
+
+
+def prev_bar_date(bar_date: str) -> str:
+    dt = datetime.strptime(bar_date, "%Y-%m-%d").replace(tzinfo=UTC) - timedelta(days=1)
+    return dt.strftime("%Y-%m-%d")
+
+
+def _utc_day_bounds_ms(bar_date: str) -> tuple[int, int]:
+    dt = datetime.strptime(bar_date, "%Y-%m-%d").replace(tzinfo=UTC)
+    start_ms = int(dt.timestamp() * 1000)
+    return start_ms, start_ms + DAY_MS
 
 
 def has_prefill_nonzero_funding(
@@ -130,6 +142,38 @@ def fill_chain_matches_exact_funding(
                 matched = True
                 break
         if not matched:
+            return False
+    return True
+
+
+def fill_chain_matches_compacted_funding(
+    *,
+    ts_list: list[int],
+    ep_list: list[float],
+    fills_synced_to_ms: int,
+    compacted_rows: list[tuple[str, float]],
+) -> bool:
+    if fills_synced_to_ms <= 0:
+        return True
+    for bdate, szi in compacted_rows:
+        day_start_ms, day_end_ms = _utc_day_bounds_ms(bdate)
+        if (day_end_ms + FUNDING_SETTLEMENT_JITTER_MS) > fills_synced_to_ms:
+            continue
+        lo_idx = bisect.bisect_left(ts_list, day_start_ms - FUNDING_SETTLEMENT_JITTER_MS) - 1
+        hi_idx = bisect.bisect_right(ts_list, day_end_ms + FUNDING_SETTLEMENT_JITTER_MS) - 1
+        init_pos = ep_list[lo_idx] if lo_idx >= 0 else 0.0
+        min_pos = init_pos
+        max_pos = init_pos
+        for idx in range(max(0, lo_idx + 1), hi_idx + 1):
+            pos_val = ep_list[idx]
+            if pos_val < min_pos:
+                min_pos = pos_val
+            if pos_val > max_pos:
+                max_pos = pos_val
+        if (
+            szi < (min_pos - COMPLETE_LIFE_POS_TOLERANCE)
+            or szi > (max_pos + COMPLETE_LIFE_POS_TOLERANCE)
+        ):
             return False
     return True
 
@@ -316,6 +360,7 @@ def reconstruct_signals(candles: list[dict[str, Any]], wallets: list[dict[str, A
             last_ep = float(ep_f[-1]) if ep_f else 0.0
             w_frows = f_rows_by_w.get(addr, [])
             exact_rows = [(bd, szi, sts) for bd, is_ex, szi, sts in w_frows if is_ex == 1]
+            compacted_rows = [(bd, szi) for bd, is_ex, szi, _sts in w_frows if is_ex == 0]
             is_comp_life = (
                 abs(last_ep - cur_szi) < COMPLETE_LIFE_POS_TOLERANCE
                 and not has_prefill_nonzero_funding(
@@ -327,6 +372,12 @@ def reconstruct_signals(candles: list[dict[str, Any]], wallets: list[dict[str, A
                     ep_list=ep_f,
                     fills_synced_to_ms=fills_synced_to_ms,
                     exact_rows=exact_rows,
+                )
+                and fill_chain_matches_compacted_funding(
+                    ts_list=ts_f,
+                    ep_list=ep_f,
+                    fills_synced_to_ms=fills_synced_to_ms,
+                    compacted_rows=compacted_rows,
                 )
             )
         else:
@@ -350,9 +401,10 @@ def reconstruct_signals(candles: list[dict[str, Any]], wallets: list[dict[str, A
         })
 
     out: dict[str, dict[str, Any]] = {}
-    for bi, c in enumerate(candles):
+    scoped_candles = [c for c in candles if c["bar_date"] >= CHURN_WARMUP_START_DATE]
+    for bi, c in enumerate(scoped_candles):
         bdate = c["bar_date"]
-        prev_bdate = candles[bi - 1]["bar_date"] if bi > 0 else bdate
+        prev_bdate = scoped_candles[bi - 1]["bar_date"] if bi > 0 else prev_bar_date(bdate)
         bar_closed = bool(c["is_complete"])
         t_ms = min(int(c["close_ts_ms"]), now_ms)
         bdate_close_ms = close_ts_ms_for_16z_bar(bdate)
