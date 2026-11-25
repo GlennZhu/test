@@ -37,6 +37,7 @@ HEDGE_MIN_OFFSET_RATIO = 0.70
 COMPLETE_LIFE_POS_TOLERANCE = 1e-2
 CHURN_WARMUP_START_DATE = "2025-07-01"
 MIN_SIGNAL_WARMUP_DATE = "2025-07-30"
+FIRST_LIVE_16Z_BAR = "2026-11-13"
 MIN_QUORUM_WHALES = 15
 
 ENTRY_TILT = 0.15
@@ -80,6 +81,37 @@ def next_bar_date(bar_date: str) -> str:
 def prev_bar_date(bar_date: str) -> str:
     dt = datetime.strptime(bar_date, "%Y-%m-%d").replace(tzinfo=UTC) - timedelta(days=1)
     return dt.strftime("%Y-%m-%d")
+
+
+def clamp_exact_16z_since_bar(
+    raw_exact_since: str,
+    *,
+    max_comp_bar: str = "",
+    min_exact_bar: str = "",
+    funding_synced_to_ms: int | None = None,
+    first_live_bar: str = FIRST_LIVE_16Z_BAR,
+) -> str:
+    if not raw_exact_since:
+        return ""
+    after_comp = next_bar_date(max_comp_bar) if max_comp_bar else ""
+    resolved = raw_exact_since
+    if first_live_bar and resolved < first_live_bar:
+        if min_exact_bar:
+            floor_bar = max(after_comp, min(min_exact_bar, first_live_bar))
+        else:
+            floor_bar = max(after_comp, first_live_bar) if after_comp else first_live_bar
+        if resolved < floor_bar:
+            resolved = floor_bar
+    if after_comp and resolved < after_comp:
+        resolved = after_comp
+    if (
+        funding_synced_to_ms is not None
+        and not min_exact_bar
+        and resolved
+        and funding_synced_to_ms < close_ts_ms_for_16z_bar(resolved)
+    ):
+        return ""
+    return resolved
 
 
 def _utc_day_bounds_ms(bar_date: str) -> tuple[int, int]:
@@ -336,7 +368,11 @@ def reconstruct_signals(candles: list[dict[str, Any]], wallets: list[dict[str, A
             pair[0].append(int(r["obs_ts_ms"]))
             pair[1].append(float(r["spot_ubtc"]))
 
-    lb_addrs = {r["address"].lower() for r in wallets if int(r["on_leaderboard"]) == 1}
+    lb_addrs = {
+        r["address"].lower()
+        for r in wallets
+        if int(r["on_leaderboard"]) == 1 or int(r.get("ever_qualified") or 0) == 1
+    }
     models = []
     for w in wallets:
         addr = w["address"].strip().lower()
@@ -344,11 +380,18 @@ def reconstruct_signals(candles: list[dict[str, Any]], wallets: list[dict[str, A
             continue
         if lb_addrs and addr not in lb_addrs:
             continue
+        exact_map = f_exact.get(addr, {})
         comp_map = f_comp.get(addr, {})
-        max_comp_bar = max(comp_map.keys()) if comp_map else ""
-        exact_since = w.get("exact_16z_since_bar") or ""
-        if max_comp_bar and exact_since and exact_since <= max_comp_bar:
-            exact_since = next_bar_date(max_comp_bar)
+        btc_max_comp_bar = max(comp_map.keys()) if comp_map else ""
+        max_comp_bar = max(btc_max_comp_bar, (w.get("all_coins_max_comp_bar") or "").strip())
+        min_exact_bar = min(exact_map.keys()) if exact_map else ""
+        funding_synced_to_ms = int(w["funding_synced_to_ms"] or 0)
+        exact_since = clamp_exact_16z_since_bar(
+            w.get("exact_16z_since_bar") or "",
+            max_comp_bar=max_comp_bar,
+            min_exact_bar=min_exact_bar,
+            funding_synced_to_ms=funding_synced_to_ms,
+        )
         cur_szi = float(w["cur_btc_szi"] or 0.0)
         fills_synced_to_ms = int(w["fills_synced_to_ms"] or 0)
         raw_comp_life = bool(int(w["is_complete_lifetime"])) and (addr not in broken_chain_addrs)
