@@ -1,12 +1,12 @@
 {
-  "as_of": "2026-11-25T02:04:57.721712+00:00",
-  "signals_rebuilt_at": "2026-11-25T02:04:57.721000+00:00",
-  "signal_reconstruction_version": "hl_l1_recon_2026_11_v5",
+  "as_of": "2026-11-25T08:52:39.396361+00:00",
+  "signals_rebuilt_at": "2026-11-25T07:59:07.590000+00:00",
+  "signal_reconstruction_version": "hl_l1_recon_2026_11_v6",
   "funding_pagination_version": "hl_l1_fund_pag_2026_11_v2",
   "last_settled_16z_bar": "2026-11-24",
   "daily_1604_swept_bar": "2026-11-24",
-  "live_btc_mid": 59090.5,
-  "live_hl_btc_oi": 35547.78532,
+  "live_btc_mid": 59324.5,
+  "live_hl_btc_oi": 35239.55868,
   "sim_default_from_earliest_quorum": {
     "first_quorum_date": "2025-07-30",
     "metrics": {
@@ -114,7 +114,7 @@
     "fills_count": 1,
     "settlements_count": 26,
     "settled_equity": 145923.97,
-    "live_marked_equity": 147469.42,
+    "live_marked_equity": 146866.19,
     "live_ticket": {
       "side": "SHORT",
       "dir": -1,
@@ -136,7 +136,7 @@
     "fills_count": 41,
     "settlements_count": 483,
     "settled_equity": 308940.19,
-    "live_marked_equity": 311705.46,
+    "live_marked_equity": 310626.11,
     "live_ticket": {
       "side": "SHORT",
       "dir": -1,

@@ -24,6 +24,7 @@ SHIFT_16Z_MS = 8 * HOUR_MS
 DIETZ_WEEK_EPOCH_MS = 0  # 1970-01-01T00:00:00Z (Thursday 00:00Z, immediately after Wednesday allTime points)
 MIN_DIETZ_WEEK_SPAN_MS = int(6.5 * DAY_MS)
 FUNDING_SETTLEMENT_JITTER_MS = 120_000
+SETTLEMENT_INDEXING_GRACE_MS = 4 * 60_000
 
 HLP_VAULT_ADDR = "0xecb63caa47c7c4e77f60f1ce858cf28dc2b82b00"
 MIN_CAPITAL_USD = 3_000_000.0
@@ -120,10 +121,20 @@ def _utc_day_bounds_ms(bar_date: str) -> tuple[int, int]:
     return start_ms, start_ms + DAY_MS
 
 
+def is_ever_on_leaderboard(w: dict[str, Any]) -> bool:
+    if int(w.get("on_leaderboard") or 0) == 1:
+        return True
+    raw_ever = w.get("ever_on_leaderboard")
+    if raw_ever is not None and str(raw_ever).strip() != "":
+        return int(raw_ever) == 1
+    return False
+
+
 def has_prefill_nonzero_funding(
     *,
     earliest_fill_ts_ms: int | None,
     funding_rows: list[tuple[str, int, float, int]],
+    synced_to_ms: int = 0,
 ) -> bool:
     earliest_utc_date = (
         datetime.fromtimestamp(earliest_fill_ts_ms / 1000.0, tz=UTC).strftime("%Y-%m-%d")
@@ -133,16 +144,21 @@ def has_prefill_nonzero_funding(
     for bdate, is_exact, szi, settled_ts_ms in funding_rows:
         if abs(szi) < COMPLETE_LIFE_POS_TOLERANCE:
             continue
-        if earliest_fill_ts_ms is None:
-            return True
         if is_exact == 1:
-            if settled_ts_ms > 0:
-                if settled_ts_ms < earliest_fill_ts_ms:
-                    return True
-            elif (close_ts_ms_for_16z_bar(bdate) + FUNDING_SETTLEMENT_JITTER_MS) < earliest_fill_ts_ms:
+            bound_ts = (
+                settled_ts_ms
+                if settled_ts_ms > 0
+                else (close_ts_ms_for_16z_bar(bdate) + FUNDING_SETTLEMENT_JITTER_MS)
+            )
+            if synced_to_ms > 0 and bound_ts > synced_to_ms:
+                continue
+            if earliest_fill_ts_ms is None or bound_ts < earliest_fill_ts_ms:
                 return True
-        elif earliest_utc_date is not None and bdate < earliest_utc_date:
-            return True
+        else:
+            if synced_to_ms > 0 and (_utc_day_bounds_ms(bdate)[1] + FUNDING_SETTLEMENT_JITTER_MS) > synced_to_ms:
+                continue
+            if earliest_utc_date is None or bdate < earliest_utc_date:
+                return True
     return False
 
 
@@ -210,6 +226,88 @@ def fill_chain_matches_compacted_funding(
     return True
 
 
+def _resolve_complete_fills_until_ms(
+    w: dict[str, Any],
+    *,
+    fill_pair: tuple[list[int], list[float]] | None,
+    chain_break_ms: int | None,
+    w_frows: list[tuple[str, int, float, int]],
+    now_ms: int,
+) -> int:
+    if chain_break_ms == 0:
+        return 0
+    fills_synced_to_ms = int(w.get("fills_synced_to_ms") or 0)
+    stored_until = int(w.get("complete_fills_until_ms") or 0)
+    raw_cl = bool(int(w.get("is_complete_lifetime") or 0))
+    cur_szi = float(w.get("cur_btc_szi") or 0.0)
+    ts_all = fill_pair[0] if fill_pair is not None else []
+    ep_all = fill_pair[1] if fill_pair is not None else []
+    exact_rows = [(bd, szi, sts) for bd, is_ex, szi, sts in w_frows if is_ex == 1]
+    compacted_rows = [(bd, szi) for bd, is_ex, szi, _sts in w_frows if is_ex == 0]
+
+    if raw_cl and chain_break_ms is None:
+        earliest_ts = ts_all[0] if ts_all else None
+        last_ep = float(ep_all[-1]) if ep_all else 0.0
+        full_valid = (
+            abs(last_ep - cur_szi) < COMPLETE_LIFE_POS_TOLERANCE
+            and not has_prefill_nonzero_funding(
+                earliest_fill_ts_ms=earliest_ts,
+                funding_rows=w_frows,
+                synced_to_ms=fills_synced_to_ms,
+            )
+            and fill_chain_matches_exact_funding(
+                ts_list=ts_all,
+                ep_list=ep_all,
+                fills_synced_to_ms=fills_synced_to_ms,
+                exact_rows=exact_rows,
+            )
+            and fill_chain_matches_compacted_funding(
+                ts_list=ts_all,
+                ep_list=ep_all,
+                fills_synced_to_ms=fills_synced_to_ms,
+                compacted_rows=compacted_rows,
+            )
+        )
+        if full_valid:
+            cand_until = max(stored_until, fills_synced_to_ms)
+            return min(cand_until, now_ms) if now_ms > 0 else cand_until
+
+    if stored_until <= 0:
+        return 0
+    prefix_until = (
+        min(stored_until, chain_break_ms - 1)
+        if (chain_break_ms is not None and chain_break_ms > 0)
+        else stored_until
+    )
+    if prefix_until <= 0:
+        return 0
+    idx_p = bisect.bisect_right(ts_all, prefix_until)
+    ts_p = ts_all[:idx_p]
+    ep_p = ep_all[:idx_p]
+    earliest_p = ts_p[0] if ts_p else None
+    if (
+        has_prefill_nonzero_funding(
+            earliest_fill_ts_ms=earliest_p,
+            funding_rows=w_frows,
+            synced_to_ms=prefix_until,
+        )
+        or not fill_chain_matches_exact_funding(
+            ts_list=ts_p,
+            ep_list=ep_p,
+            fills_synced_to_ms=prefix_until,
+            exact_rows=exact_rows,
+        )
+        or not fill_chain_matches_compacted_funding(
+            ts_list=ts_p,
+            ep_list=ep_p,
+            fills_synced_to_ms=prefix_until,
+            compacted_rows=compacted_rows,
+        )
+    ):
+        return 0
+    return min(prefix_until, now_ms) if now_ms > 0 else prefix_until
+
+
 def build_causal_nav_features(
     raw_av_by_addr: dict[str, list[tuple[int, float, float]]],
     *,
@@ -217,9 +315,14 @@ def build_causal_nav_features(
 ) -> dict[str, tuple[list[int], list[float], list[float], list[int]]]:
     nav_feat: dict[str, tuple[list[int], list[float], list[float], list[int]]] = {}
     for addr, pts in raw_av_by_addr.items():
-        if not pts:
+        scoped_pts = (
+            [p for p in pts if int(p[0]) <= int(now_ms)]
+            if now_ms is not None
+            else list(pts)
+        )
+        if not scoped_pts:
             continue
-        pts_ts = [int(p[0]) for p in pts]
+        pts_ts = [int(p[0]) for p in scoped_pts]
         first_ts = pts_ts[0]
         last_ts = pts_ts[-1]
         horizon_ts = max(last_ts, int(now_ms)) if (now_ms is not None and int(now_ms) > last_ts) else last_ts
@@ -227,13 +330,13 @@ def build_causal_nav_features(
         k_end = (horizon_ts - DIETZ_WEEK_EPOCH_MS) // WEEK_MS
 
         events: list[tuple[int, int, float, float, int]] = [
-            (int(p[0]), 0, float(p[1]), float(p[2]), int(p[0])) for p in pts
+            (int(p[0]), 0, float(p[1]), float(p[2]), int(p[0])) for p in scoped_pts
         ]
         for k in range(k_start, k_end + 1):
             w_ms = DIETZ_WEEK_EPOCH_MS + k * WEEK_MS
             idx = bisect.bisect_right(pts_ts, w_ms) - 1
             if idx >= 0:
-                events.append((w_ms, 1, float(pts[idx][1]), float(pts[idx][2]), pts_ts[idx]))
+                events.append((w_ms, 1, float(scoped_pts[idx][1]), float(scoped_pts[idx][2]), pts_ts[idx]))
         events.sort(key=lambda item: (item[0], item[1]))
 
         av_timestamps: list[int] = []
@@ -246,7 +349,7 @@ def build_causal_nav_features(
         active_weeks = 0
         base_ts = first_ts
         base_pt_ts = first_ts
-        base_av, base_cp = float(pts[0][1]), float(pts[0][2])
+        base_av, base_cp = float(scoped_pts[0][1]), float(scoped_pts[0][2])
         prev_peak = max(base_av, 0.0)
         has_closed_week = False
 
@@ -290,8 +393,10 @@ def build_causal_nav_features(
 def load_raw_inputs() -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
     meta = json.loads((RAW / "service_meta.json").read_text(encoding="utf-8"))
     with (RAW / "btc_candles_16z.csv").open(encoding="utf-8") as f:
-        candles = [
-            {
+        candles = []
+        for r in csv.DictReader(f):
+            raw_rate = (r.get("funding_rate_16z") or "").strip()
+            candles.append({
                 "bar_date": r["bar_date"],
                 "open_ts_ms": int(r["open_ts_ms"]),
                 "close_ts_ms": int(r["close_ts_ms"]),
@@ -301,9 +406,8 @@ def load_raw_inputs() -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[
                 "btc_close": float(r["close"]),
                 "btc_volume": float(r["volume"]),
                 "is_complete": int(r["is_complete"]),
-            }
-            for r in csv.DictReader(f)
-        ]
+                "funding_rate_16z": float(raw_rate) if raw_rate != "" else None,
+            })
     oi_map: dict[str, float] = {}
     with (RAW / "btc_exchange_oi_daily.csv").open(encoding="utf-8") as f:
         for r in csv.DictReader(f):
@@ -321,27 +425,33 @@ def reconstruct_signals(candles: list[dict[str, Any]], wallets: list[dict[str, A
     nav_feat = build_causal_nav_features(raw_av, now_ms=now_ms)
 
     fills_by_w: dict[str, tuple[list[int], list[float]]] = {}
-    broken_chain_addrs: set[str] = set()
+    fill_chain_break_ms_by_w: dict[str, int] = {}
     prev_ep_by_w: dict[str, float] = {}
     with (RAW / "wallet_btc_fills.csv").open(encoding="utf-8") as f:
         for r in csv.DictReader(f):
             a = r["address"]
+            if a in fill_chain_break_ms_by_w:
+                continue
+            ts_val = int(r["ts_ms"])
             sp = float(r["start_pos"])
             ep = float(r["end_pos"])
             if a not in prev_ep_by_w:
                 if abs(sp) >= COMPLETE_LIFE_POS_TOLERANCE:
-                    broken_chain_addrs.add(a)
+                    fill_chain_break_ms_by_w[a] = 0
+                    continue
             elif abs(sp - prev_ep_by_w[a]) >= COMPLETE_LIFE_POS_TOLERANCE:
-                broken_chain_addrs.add(a)
+                fill_chain_break_ms_by_w[a] = max(1, ts_val)
+                continue
             prev_ep_by_w[a] = ep
             pair = fills_by_w.get(a)
             if pair is None:
                 pair = ([], [])
                 fills_by_w[a] = pair
-            pair[0].append(int(r["ts_ms"]))
+            pair[0].append(ts_val)
             pair[1].append(ep)
 
     f_exact: dict[str, dict[str, float]] = {}
+    f_exact_ts: dict[str, dict[str, int]] = {}
     f_comp: dict[str, dict[str, float]] = {}
     f_rows_by_w: dict[str, list[tuple[str, int, float, int]]] = {}
     with (RAW / "wallet_daily_funding_szi.csv").open(encoding="utf-8") as f:
@@ -352,8 +462,11 @@ def reconstruct_signals(candles: list[dict[str, Any]], wallets: list[dict[str, A
             szi = float(r["szi"])
             sts = int(r.get("settled_ts_ms") or 0)
             f_rows_by_w.setdefault(a, []).append((bd, is_ex, szi, sts))
-            target = f_exact if is_ex == 1 else f_comp
-            target.setdefault(a, {})[bd] = szi
+            if is_ex == 1:
+                f_exact.setdefault(a, {})[bd] = szi
+                f_exact_ts.setdefault(a, {})[bd] = sts
+            else:
+                f_comp.setdefault(a, {})[bd] = szi
 
     spot_by_w: dict[str, tuple[list[int], list[float]]] = {}
     with (RAW / "wallet_spot_ubtc_daily.csv").open(encoding="utf-8") as f:
@@ -368,10 +481,15 @@ def reconstruct_signals(candles: list[dict[str, Any]], wallets: list[dict[str, A
             pair[0].append(int(r["obs_ts_ms"]))
             pair[1].append(float(r["spot_ubtc"]))
 
+    zero_rate_bars = {
+        str(c["bar_date"])
+        for c in candles
+        if c.get("funding_rate_16z") is not None and abs(float(c["funding_rate_16z"])) <= 1e-15
+    }
     lb_addrs = {
-        r["address"].lower()
+        r["address"].strip().lower()
         for r in wallets
-        if int(r["on_leaderboard"]) == 1 or int(r.get("ever_qualified") or 0) == 1
+        if is_ever_on_leaderboard(r) or int(r.get("ever_qualified") or 0) == 1
     }
     models = []
     for w in wallets:
@@ -380,60 +498,82 @@ def reconstruct_signals(candles: list[dict[str, Any]], wallets: list[dict[str, A
             continue
         if lb_addrs and addr not in lb_addrs:
             continue
-        exact_map = f_exact.get(addr, {})
-        comp_map = f_comp.get(addr, {})
+        raw_exact_map = f_exact.get(addr, {})
+        raw_exact_ts = f_exact_ts.get(addr, {})
+        raw_comp_map = f_comp.get(addr, {})
+        exact_map = (
+            {
+                bd: szi
+                for bd, szi in raw_exact_map.items()
+                if max(close_ts_ms_for_16z_bar(bd), int(raw_exact_ts.get(bd, 0) or 0)) <= now_ms
+            }
+            if now_ms > 0
+            else raw_exact_map
+        )
+        comp_map = (
+            {bd: szi for bd, szi in raw_comp_map.items() if _utc_day_bounds_ms(bd)[1] <= now_ms}
+            if now_ms > 0
+            else raw_comp_map
+        )
         btc_max_comp_bar = max(comp_map.keys()) if comp_map else ""
-        max_comp_bar = max(btc_max_comp_bar, (w.get("all_coins_max_comp_bar") or "").strip())
+        raw_all_comp = (w.get("all_coins_max_comp_bar") or "").strip()
+        causal_all_comp = (
+            raw_all_comp
+            if (raw_all_comp and (now_ms <= 0 or _utc_day_bounds_ms(raw_all_comp)[1] <= now_ms))
+            else ""
+        )
+        max_comp_bar = max(btc_max_comp_bar, causal_all_comp)
         min_exact_bar = min(exact_map.keys()) if exact_map else ""
-        funding_synced_to_ms = int(w["funding_synced_to_ms"] or 0)
+        settled_bar = (w.get("settled_16z_bar") or "").strip()
+        raw_funding_synced_ms = int(w.get("funding_synced_to_ms") or 0)
+        if now_ms > 0 and raw_funding_synced_ms > now_ms:
+            closed_bar_now = bar_date_for_16z_open_ms(max(0, now_ms - DAY_MS))
+            closed_ms_now = close_ts_ms_for_16z_bar(closed_bar_now)
+            if (
+                closed_ms_now <= now_ms < (closed_ms_now + SETTLEMENT_INDEXING_GRACE_MS)
+                and closed_bar_now not in exact_map
+            ):
+                funding_synced_to_ms = min(now_ms, closed_ms_now - 1)
+            else:
+                funding_synced_to_ms = now_ms
+        else:
+            funding_synced_to_ms = raw_funding_synced_ms
+        if settled_bar and close_ts_ms_for_16z_bar(settled_bar) > funding_synced_to_ms:
+            settled_bar = ""
+
+        raw_exact_since = (w.get("exact_16z_since_bar") or "").strip()
+        if (
+            now_ms > 0
+            and raw_exact_since
+            and close_ts_ms_for_16z_bar(raw_exact_since) > funding_synced_to_ms
+        ):
+            raw_exact_since = ""
         exact_since = clamp_exact_16z_since_bar(
-            w.get("exact_16z_since_bar") or "",
+            raw_exact_since,
             max_comp_bar=max_comp_bar,
             min_exact_bar=min_exact_bar,
             funding_synced_to_ms=funding_synced_to_ms,
         )
-        cur_szi = float(w["cur_btc_szi"] or 0.0)
-        fills_synced_to_ms = int(w["fills_synced_to_ms"] or 0)
-        raw_comp_life = bool(int(w["is_complete_lifetime"])) and (addr not in broken_chain_addrs)
-        if raw_comp_life:
-            fp = fills_by_w.get(addr)
-            ts_f = fp[0] if fp is not None else []
-            ep_f = fp[1] if fp is not None else []
-            earliest_fill_ts = ts_f[0] if ts_f else None
-            last_ep = float(ep_f[-1]) if ep_f else 0.0
-            w_frows = f_rows_by_w.get(addr, [])
-            exact_rows = [(bd, szi, sts) for bd, is_ex, szi, sts in w_frows if is_ex == 1]
-            compacted_rows = [(bd, szi) for bd, is_ex, szi, _sts in w_frows if is_ex == 0]
-            is_comp_life = (
-                abs(last_ep - cur_szi) < COMPLETE_LIFE_POS_TOLERANCE
-                and not has_prefill_nonzero_funding(
-                    earliest_fill_ts_ms=earliest_fill_ts,
-                    funding_rows=w_frows,
-                )
-                and fill_chain_matches_exact_funding(
-                    ts_list=ts_f,
-                    ep_list=ep_f,
-                    fills_synced_to_ms=fills_synced_to_ms,
-                    exact_rows=exact_rows,
-                )
-                and fill_chain_matches_compacted_funding(
-                    ts_list=ts_f,
-                    ep_list=ep_f,
-                    fills_synced_to_ms=fills_synced_to_ms,
-                    compacted_rows=compacted_rows,
-                )
-            )
-        else:
-            is_comp_life = False
+        cur_szi = float(w.get("cur_btc_szi") or 0.0)
+        pos_synced_at_ms = int(w.get("position_synced_at_ms") or 0)
+        complete_fills_until_ms = _resolve_complete_fills_until_ms(
+            w,
+            fill_pair=fills_by_w.get(addr),
+            chain_break_ms=fill_chain_break_ms_by_w.get(addr),
+            w_frows=f_rows_by_w.get(addr, []),
+            now_ms=now_ms,
+        )
         models.append({
             "addr": addr,
             "cur_szi": cur_szi,
-            "is_complete_life": is_comp_life,
-            "fills_synced_to_ms": fills_synced_to_ms,
-            "funding_backfilled": bool(int(w["funding_backfilled"])),
-            "funding_synced_to_ms": int(w["funding_synced_to_ms"] or 0),
+            "pos_synced_at_ms": pos_synced_at_ms,
+            "complete_fills_until_ms": complete_fills_until_ms,
+            "funding_backfilled": bool(int(w.get("funding_backfilled") or 0)),
+            "funding_synced_to_ms": funding_synced_to_ms,
             "exact_16z_since_bar": exact_since,
-            "settled_16z_bar": w.get("settled_16z_bar") or "",
+            "settled_16z_bar": settled_bar,
+            "f_exact": exact_map,
+            "f_comp": comp_map,
             "first_av_ms": nav_feat[addr][0][0],
             "has_prev_obs": False,
             "prev_szi": 0.0,
@@ -444,12 +584,15 @@ def reconstruct_signals(candles: list[dict[str, Any]], wallets: list[dict[str, A
         })
 
     out: dict[str, dict[str, Any]] = {}
-    scoped_candles = [c for c in candles if c["bar_date"] >= CHURN_WARMUP_START_DATE]
+    scoped_candles = [
+        c for c in candles if c["bar_date"] >= CHURN_WARMUP_START_DATE and int(c["open_ts_ms"]) < now_ms
+    ]
     for bi, c in enumerate(scoped_candles):
         bdate = c["bar_date"]
         prev_bdate = scoped_candles[bi - 1]["bar_date"] if bi > 0 else prev_bar_date(bdate)
-        bar_closed = bool(c["is_complete"])
-        t_ms = min(int(c["close_ts_ms"]), now_ms)
+        close_ms = int(c["close_ts_ms"])
+        bar_closed = bool(c["is_complete"]) and now_ms >= close_ms
+        t_ms = min(close_ms, now_ms)
         bdate_close_ms = close_ts_ms_for_16z_bar(bdate)
         before_warmup = bdate < MIN_SIGNAL_WARMUP_DATE
 
@@ -459,14 +602,23 @@ def reconstruct_signals(candles: list[dict[str, Any]], wallets: list[dict[str, A
             if t_ms < wm["first_av_ms"]:
                 continue
             addr = wm["addr"]
-            fe = f_exact.get(addr, {})
-            fc = f_comp.get(addr, {})
-            if not bar_closed:
+            fe = wm["f_exact"]
+            fc = wm["f_comp"]
+            if not bar_closed and wm["pos_synced_at_ms"] <= t_ms:
                 szi_t = wm["cur_szi"]
+            elif wm["complete_fills_until_ms"] > 0 and t_ms <= wm["complete_fills_until_ms"]:
+                pair = fills_by_w.get(addr)
+                if pair is None or not pair[0]:
+                    szi_t = 0.0
+                else:
+                    ts_f, ep_f = pair
+                    idx_f = bisect.bisect_right(ts_f, t_ms) - 1
+                    szi_t = ep_f[idx_f] if idx_f >= 0 else 0.0
             elif t_ms >= bdate_close_ms and bdate in fe:
                 szi_t = fe[bdate]
             elif (
                 t_ms >= bdate_close_ms
+                and bdate not in zero_rate_bars
                 and bdate_close_ms <= wm["funding_synced_to_ms"]
                 and (
                     (wm["exact_16z_since_bar"] and bdate >= wm["exact_16z_since_bar"])
@@ -474,14 +626,12 @@ def reconstruct_signals(candles: list[dict[str, Any]], wallets: list[dict[str, A
                 )
             ):
                 szi_t = fe.get(bdate, 0.0)
-            elif wm["is_complete_life"] and addr in fills_by_w and t_ms <= wm["fills_synced_to_ms"]:
-                ts_f, ep_f = fills_by_w[addr]
-                idx_f = bisect.bisect_right(ts_f, t_ms) - 1
-                szi_t = ep_f[idx_f] if idx_f >= 0 else 0.0
             elif prev_bdate in fe:
                 szi_t = fe[prev_bdate]
             elif wm["funding_backfilled"]:
-                szi_t = fc.get(prev_bdate, 0.0)
+                bdate_utc_midnight_ms = bdate_close_ms - 16 * HOUR_MS
+                comp_bdate = prev_bar_date(prev_bdate) if t_ms < bdate_utc_midnight_ms else prev_bdate
+                szi_t = fc.get(comp_bdate, 0.0)
             else:
                 szi_t = 0.0
 
